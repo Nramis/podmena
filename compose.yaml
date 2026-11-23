@@ -1,0 +1,98 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: podmena
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_admin_password
+    secrets:
+      - db_password
+      - db_admin_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "podmena", "-d", "podmena"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  migrate:
+    image: podmena-app:local
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    read_only: true
+    networks:
+      - database
+
+  app:
+    image: podmena-app:local
+    build: .
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      MATRIX_KEY_FILE: /run/secrets/matrix_key
+      TRUST_PROXY: "1"
+    secrets:
+      - db_password
+      - matrix_key
+    read_only: true
+    tmpfs:
+      - /tmp:size=1200m,mode=1777,nosuid,nodev,noexec
+    networks:
+      - web
+      - database
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/api/health', timeout=3).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_ADDRESS: ${APP_DOMAIN:-localhost}
+    ports:
+      - "${BIND_ADDRESS:-0.0.0.0}:${HTTP_PORT:-80}:80"
+      - "${BIND_ADDRESS:-0.0.0.0}:${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - web
+
+networks:
+  web:
+  database:
+    internal: true
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  db_password:
+    file: ${DB_PASSWORD_FILE:-./.secrets/db_password}
+  db_admin_password:
+    file: ${DB_ADMIN_PASSWORD_FILE:-./.secrets/db_admin_password}
+  matrix_key:
+    file: ${MATRIX_KEY_FILE:-./.secrets/matrix_key}

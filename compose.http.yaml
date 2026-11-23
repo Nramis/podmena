@@ -1,0 +1,10 @@
+services:
+  app:
+    environment:
+      SECURE_COOKIE: "0"
+
+  proxy:
+    environment:
+      APP_ADDRESS: ":80"
+    ports: !override
+      - "127.0.0.1:${HTTP_PORT:-80}:80"
