@@ -1,12 +1,15 @@
 import { TextArea, TextInput } from '@gravity-ui/uikit'
 import { Action, Confirm, Feedback, Selection } from './ui'
-import { useEffect, useRef, useState } from 'react'
-import { Copy, Download, FileText, FolderOpen, RotateCcw, ScanSearch, TextSelect } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Copy, Download, FileText, FolderOpen, RotateCcw, ScanSearch, Search, TextSelect } from 'lucide-react'
 import { api, errorMessage, saveBlob, send, versionPath } from './api'
 import type { Draft, Matrix, MatrixRef, Version } from './api'
 import { fromVersion, MatrixPicker, newDraft, PairEditor, tidy } from './Matrices'
+import { findDocumentSuggestions } from './documentSuggestions'
+import type { DocumentSuggestion } from './documentSuggestions'
 
 const MAX_TEXT = 250_000
+const SUGGESTIONS_PER_PAGE = 15
 const FORMATS = '.txt,.md,.csv,.tsv,.log,.json,.docx,.pdf'
 type Result = {text: string; changed: number; unknown?: string[]; matrix?: MatrixRef}
 
@@ -22,6 +25,9 @@ export default function Documents({mode, matrices, selected, select, refresh}: P
   const [draft, setDraft] = useState<Draft>(newDraft)
   const [label, setLabel] = useState('')
   const [fragment, setFragment] = useState('')
+  const [suggestions, setSuggestions] = useState<DocumentSuggestion[] | null>(null)
+  const [skipped, setSkipped] = useState<Set<string>>(() => new Set())
+  const [suggestionLimit, setSuggestionLimit] = useState(SUGGESTIONS_PER_PAGE)
   const [result, setResult] = useState<Result | null>(null)
   const [busy, setBusy] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -29,12 +35,30 @@ export default function Documents({mode, matrices, selected, select, refresh}: P
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const input = useRef<HTMLInputElement>(null)
+  const availableSuggestions = useMemo(() => {
+    if (!suggestions) return []
+    const originals = new Set(tidy(draft.pairs).filter(pair => pair.kind !== 'number').map(pair => pair.original))
+    return suggestions.filter(({original}) => !originals.has(original) && !skipped.has(original))
+  }, [suggestions, draft.pairs, skipped])
   useEffect(() => {
     if (mode === 'restore') { setResult(null); setNotice(''); setError('') }
   }, [mode, selected?.id, selected?.version])
 
   function invalidate() {
     setResult(null); setNotice(''); setError('')
+  }
+
+  function updateText(value: string) {
+    setText(value)
+    setFragment('')
+    setSuggestions(null)
+    invalidate()
+  }
+
+  function scanText() {
+    setSuggestions(findDocumentSuggestions(text))
+    setSkipped(new Set())
+    setSuggestionLimit(SUGGESTIONS_PER_PAGE)
   }
 
   function updateDraft(value: Draft) {
@@ -74,8 +98,8 @@ export default function Documents({mode, matrices, selected, select, refresh}: P
         setError('В документе больше 250 000 символов.')
         return
       }
-      invalidate()
-      setText(loaded.text); setName(file.name); setFragment('')
+      updateText(loaded.text)
+      setName(file.name)
     })
   }
 
@@ -190,6 +214,7 @@ export default function Documents({mode, matrices, selected, select, refresh}: P
           <div className="document-toolbar">
             <h2>Исходный текст</h2>
             <div className="document-selectbar">
+              <Action disabled={busy || !text.trim()} onClick={scanText}><Search size={17}/> Найти фрагменты</Action>
               <Action disabled={busy || !fragment} onMouseDown={event => event.preventDefault()}
                 onClick={() => collect(fragment)}><TextSelect size={17}/> Добавить выделение</Action>
               <kbd title="Добавить выделение с клавиатуры">Ctrl/⌘ + Enter</kbd>
@@ -199,7 +224,7 @@ export default function Documents({mode, matrices, selected, select, refresh}: P
           </div>
           <TextArea size="l" className="document-input" rows={11} value={text} disabled={busy}
             placeholder="Вставьте текст или перетащите файл сюда"
-            onChange={event => { setText(event.target.value); setFragment(''); invalidate() }}
+            onChange={event => updateText(event.target.value)}
             controlProps={{'aria-label': 'Исходный текст', maxLength: MAX_TEXT, onSelect: event => {
               const field = event.currentTarget
               setFragment(field.value.slice(field.selectionStart, field.selectionEnd).trim())
@@ -212,6 +237,32 @@ export default function Documents({mode, matrices, selected, select, refresh}: P
               }
             }}/>
           {!text && <p className="hint document-formats">TXT, Markdown, CSV, TSV, LOG, JSON, Word и PDF · до 10 МБ</p>}
+          {suggestions && <section className="document-suggestions" aria-labelledby="document-suggestions-title">
+            <h3 id="document-suggestions-title">Кандидаты на подмену</h3>
+            <p className="hint" role="status">{availableSuggestions.length
+              ? `К проверке: ${availableSuggestions.length.toLocaleString('ru')}`
+              : suggestions.length ? 'Больше нет фрагментов для проверки.' : 'Кандидатов на подмену не найдено.'}</p>
+            {!!availableSuggestions.length && <ul className="suggestion-list">
+              {availableSuggestions.slice(0, suggestionLimit).map(({original, start, category}) => {
+                const end = start + original.length
+                const contextStart = Math.max(0, start - 32)
+                const contextEnd = Math.min(text.length, end + 32)
+                return <li key={original} className="suggestion-row">
+                  <div className="suggestion-copy">
+                    <span className="hint">{category}</span>
+                    <div className="suggestion-context">{contextStart > 0 && '…'}{text.slice(contextStart, start)}<mark>{original}</mark>{text.slice(end, contextEnd)}{contextEnd < text.length && '…'}</div>
+                  </div>
+                  <div className="actions wrap">
+                    <Action className="small" disabled={busy} aria-label={`Добавить «${original}»`} onClick={() => collect(original)}>Добавить</Action>
+                    <Action className="small subtle" disabled={busy} aria-label={`Пропустить «${original}»`}
+                      onClick={() => setSkipped(previous => new Set([...previous, original]))}>Пропустить</Action>
+                  </div>
+                </li>
+              })}
+            </ul>}
+            {availableSuggestions.length > suggestionLimit && <Action className="small" disabled={busy}
+              onClick={() => setSuggestionLimit(limit => limit + SUGGESTIONS_PER_PAGE)}>Показать ещё</Action>}
+          </section>}
         </div>
         <div className="surface document-card">
           <div className="document-toolbar"><h2>Результат подмены</h2><div className="actions wrap end">{resultActions}</div></div>
